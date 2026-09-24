@@ -20,8 +20,12 @@
   <nav class="tabbar" aria-label="Main">
     <a href="#/" data-tab="home"><span aria-hidden="true">🏋️</span>Workouts</a>
     <a href="#/history" data-tab="history"><span aria-hidden="true">📅</span>History</a>
+    <a href="#/progress" data-tab="progress"><span aria-hidden="true">📈</span>Progress</a>
     <a href="#/settings" data-tab="settings"><span aria-hidden="true">⚙️</span>Settings</a>
   </nav>
+
+  <dialog id="modal" class="modal"><div id="modal-body"></div></dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
   <script src="app.js"></script>
 </body>
