@@ -126,16 +126,14 @@ function emptyDb() {
     workouts: [], // { id, name, createdAt, updatedAt, exercises: [{ id, name, sets, reps, link }] }
     history: [], // finished sessions, oldest first
     meta: {}, // per exercise (keyed by normalized name): { name, muscle, note, target, updatedAt }
-    deleted: {}, // id → deletion time, so deletes survive a sync merge
-    active: null, // the session currently being executed (never synced)
+    active: null, // the session currently being executed
     settings: { ...DEFAULT_SETTINGS },
-    sync: { token: '', gistId: '', lastSync: 0, auto: true, error: '' }, // device-only
     sheets: { lastPush: 0, dirty: false, error: '' }, // device-only
     auth: { hash: '', at: 0 }, // device-only: SHA-256 of the password in Workouts!Z100
   };
 }
 
-// Accepts saved data of any version (or a backup file) and returns a complete v2 db.
+// Accepts saved data of any version and returns a complete v2 db.
 function migrate(d) {
   const out = emptyDb();
   if (!d || typeof d !== 'object') return out;
@@ -159,10 +157,8 @@ function migrate(d) {
     updatedAt: s.updatedAt || s.finishedAt || 0,
   }));
   if (d.meta && typeof d.meta === 'object') out.meta = d.meta;
-  if (d.deleted && typeof d.deleted === 'object') out.deleted = d.deleted;
   out.active = d.active || null;
   out.settings = { ...DEFAULT_SETTINGS, ...(d.settings || {}) };
-  out.sync = { ...out.sync, ...(d.sync || {}) };
   out.sheets = { ...out.sheets, ...(d.sheets || {}) };
   out.auth = { ...out.auth, ...(d.auth || {}) };
   return out;
@@ -189,7 +185,6 @@ function save() {
 // Save a change that other devices should receive.
 function commit() {
   save();
-  scheduleSync();
   schedulePush();
 }
 
@@ -360,13 +355,6 @@ function route(keepScroll) {
 function go(hash) {
   if (location.hash === hash) route();
   else location.hash = hash;
-}
-
-// Re-render after background changes (sync), but never under the user's fingers.
-function refreshView() {
-  const focused = document.activeElement;
-  if (focused && app.contains(focused) && /^(INPUT|TEXTAREA|SELECT)$/.test(focused.tagName)) return;
-  if (['', 'history', 'progress', 'exercise', 'settings'].includes(currentView())) route(true);
 }
 
 let toastTimer = null;
@@ -1496,140 +1484,12 @@ function hideChartTip(e) {
   svg.querySelectorAll('.bar.hl').forEach((b) => b.classList.remove('hl'));
 }
 
-/* =========================================================================
-   Sync across devices (optional): a private GitHub Gist in the user's account
-   ========================================================================= */
-
-// Merge two copies of the data. Newest edit wins per item; deletions win over older edits.
-function mergeData(a, b) {
-  const deleted = { ...a.deleted };
-  for (const [k, v] of Object.entries(b.deleted || {})) deleted[k] = Math.max(deleted[k] || 0, v);
-  const pick = (la, lb) => {
-    const map = new Map();
-    for (const x of la) map.set(x.id, x);
-    for (const x of lb) {
-      const cur = map.get(x.id);
-      if (!cur || (x.updatedAt || 0) > (cur.updatedAt || 0)) map.set(x.id, x);
-    }
-    return [...map.values()].filter((x) => !(deleted[x.id] >= (x.updatedAt || 0)));
-  };
-  const meta = { ...a.meta };
-  for (const [k, v] of Object.entries(b.meta || {})) if (!meta[k] || (v.updatedAt || 0) > (meta[k].updatedAt || 0)) meta[k] = v;
-  return {
-    workouts: pick(a.workouts, b.workouts),
-    history: pick(a.history, b.history).sort((x, y) => x.finishedAt - y.finishedAt),
-    meta,
-    deleted,
-    settings: (b.settings.updatedAt || 0) > (a.settings.updatedAt || 0) ? b.settings : a.settings,
-  };
-}
-
-function applyMerged(m) {
-  Object.assign(db, m);
-}
-
-function sharedData() {
-  const { workouts, history, meta, deleted, settings } = db;
-  return { app: 'trackfit', version: 2, savedAt: new Date().toISOString(), workouts, history, meta, deleted, settings };
-}
-
-let syncing = false;
-let syncTimer = null;
-
-function scheduleSync() {
-  if (!db.sync.token || !db.sync.auto) return;
-  clearTimeout(syncTimer);
-  syncTimer = setTimeout(() => syncNow(true), 3000);
-}
-
-async function gh(path, opts = {}) {
-  const res = await fetch('https://api.github.com' + path, {
-    ...opts,
-    headers: {
-      Accept: 'application/vnd.github+json',
-      Authorization: 'Bearer ' + db.sync.token,
-      'X-GitHub-Api-Version': '2022-11-28',
-      ...(opts.body ? { 'Content-Type': 'application/json' } : {}),
-    },
-  });
-  if (!res.ok) {
-    const msg = res.status === 401 ? 'GitHub rejected the token (expired or revoked?)'
-      : res.status === 403 ? 'the token lacks the "gist" permission, or GitHub rate-limited it'
-      : `GitHub error ${res.status}`;
-    throw Object.assign(new Error(msg), { status: res.status });
-  }
-  return res.json();
-}
-
-async function syncNow(quiet) {
-  if (syncing || !db.sync.token) return;
-  if (!navigator.onLine) {
-    if (!quiet) toast('Offline — will sync later.');
-    return;
-  }
-  syncing = true;
-  setSyncStatus('Syncing…');
-  try {
-    let gist = null;
-    if (db.sync.gistId) {
-      try {
-        gist = await gh('/gists/' + db.sync.gistId);
-      } catch (err) {
-        if (err.status !== 404) throw err;
-        db.sync.gistId = '';
-      }
-    }
-    if (!gist) {
-      // Another device may already have created it: look for it by file name.
-      for (let page = 1; page <= 10 && !gist; page++) {
-        const list = await gh(`/gists?per_page=100&page=${page}`);
-        const hit = list.find((g) => g.files && g.files[SYNC_FILE]);
-        if (hit) gist = await gh('/gists/' + hit.id);
-        if (list.length < 100) break;
-      }
-    }
-    if (gist) {
-      const file = gist.files[SYNC_FILE];
-      const text = file.truncated ? await (await fetch(file.raw_url)).text() : file.content;
-      applyMerged(mergeData(db, migrate(JSON.parse(text))));
-    }
-    const content = JSON.stringify(sharedData());
-    if (gist) {
-      await gh('/gists/' + gist.id, { method: 'PATCH', body: JSON.stringify({ files: { [SYNC_FILE]: { content } } }) });
-      db.sync.gistId = gist.id;
-    } else {
-      const created = await gh('/gists', {
-        method: 'POST',
-        body: JSON.stringify({ description: 'Trackfit workout data (synced by the Trackfit app)', public: false, files: { [SYNC_FILE]: { content } } }),
-      });
-      db.sync.gistId = created.id;
-    }
-    db.sync.lastSync = Date.now();
-    db.sync.error = '';
-    save();
-    if (!quiet) toast('✓ Synced');
-  } catch (err) {
-    db.sync.error = err.message;
-    save();
-    if (!quiet) toast('Sync failed: ' + esc(err.message), 5000);
-  } finally {
-    syncing = false;
-    refreshView();
-  }
-}
-
-function setSyncStatus(text) {
-  const el = document.getElementById('sync-status');
-  if (el) el.textContent = text;
-}
-
 window.addEventListener('online', () => {
-  scheduleSync();
   if (db.sheets.dirty) schedulePush(true);
 });
 
 /* =========================================================================
-   Google Sheets (optional): live rows sent to an Apps Script web app in the user's sheet.
+   Google Sheets: live rows sent to an Apps Script web app in the user's sheet.
    Column order must match TABS in google-sheets/Code.gs.
    ========================================================================= */
 
@@ -1863,26 +1723,11 @@ function setSheetStatus(text) {
 }
 
 /* =========================================================================
-   Settings & backup
+   Settings
    ========================================================================= */
 
 function renderSettings() {
   const s = db.settings;
-  const sy = db.sync;
-  const syncSection = sy.token
-    ? `<p><span class="tag ${sy.error ? 'hard' : 'easy'}">${sy.error ? 'Problem' : 'Connected'}</span>
-         <span class="muted" id="sync-status">${sy.error ? esc(sy.error) : sy.lastSync ? 'Last synced ' + fmtAgo(sy.lastSync) : 'Not synced yet'}</span></p>
-       <label class="switch"><input type="checkbox" data-sync="auto" ${sy.auto ? 'checked' : ''}><span>Sync automatically after changes</span></label>
-       <div class="row gap"><button class="btn" data-action="sync-now">⟳ Sync now</button><button class="btn danger" data-action="sync-disconnect">Disconnect</button></div>`
-    : `<ol class="steps">
-         <li>Create a GitHub token with only the <b>gist</b> permission:
-           <a href="https://github.com/settings/tokens/new?scopes=gist&description=Trackfit%20sync" target="_blank" rel="noopener">create token ↗</a></li>
-         <li>Paste it below — on each phone or computer you use.</li>
-       </ol>
-       <label class="field"><span>GitHub token</span><input id="sync-token" type="password" autocomplete="off" placeholder="ghp_… or github_pat_…"></label>
-       <button class="btn primary block" data-action="sync-connect">Connect &amp; sync</button>
-       <p class="muted small-note">Your data goes to a <b>secret gist</b> in your GitHub account: unlisted, but anyone with its exact link can read it. The token is stored only in this browser and can only touch gists.</p>`;
-
   const sh = db.sheets;
   const sheetSection = `
     <p><span class="tag ${sh.error ? 'hard' : 'easy'}" id="sheet-tag">${sh.error ? 'Problem' : 'Live'}</span>
@@ -1920,60 +1765,10 @@ function renderSettings() {
         <div class="stack">${sheetSection}</div>
       </section>
 
-      <section class="card">
-        <h2>Sync across devices <small class="muted">(optional)</small></h2>
-        <p class="muted">Off by default: your data stays on this device. Turn it on to keep your phone and other devices in sync through your own GitHub account.</p>
-        <div class="stack">${syncSection}</div>
-      </section>
-
-      <section class="card">
-        <h2>Backup</h2>
-        <p class="muted">Clearing browser data erases everything stored here. Export a backup now and then.</p>
-        <div class="stack">
-          <button class="btn block" data-action="export">⬇ Export backup</button>
-          <label class="btn block">⬆ Import &amp; merge<input type="file" data-import="merge" accept="application/json,.json" hidden></label>
-          <label class="btn block">⬆ Import &amp; replace everything<input type="file" data-import="replace" accept="application/json,.json" hidden></label>
-          <button class="btn block danger" data-action="wipe">Erase all data on this device</button>
-        </div>
-      </section>
-
       <p class="muted" style="text-align:center;margin-top:20px;font-size:.85rem">
         ${plural(db.workouts.length, 'workout')} · ${plural(db.history.length, 'logged session')}
       </p>
     </div>`;
-}
-
-function exportData() {
-  const blob = new Blob([JSON.stringify({ ...sharedData(), active: db.active }, null, 2)], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = `trackfit-backup-${new Date().toISOString().slice(0, 10)}.json`;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
-
-async function importData(file, mode) {
-  try {
-    const raw = JSON.parse(await file.text());
-    if (!Array.isArray(raw.workouts) || !Array.isArray(raw.history)) throw new Error('This does not look like a Trackfit backup.');
-    const data = migrate(raw);
-    const summary = `${plural(data.workouts.length, 'workout')} and ${plural(data.history.length, 'logged session')}`;
-    if (mode === 'replace') {
-      if (!confirm(`Replace everything on this device with ${summary} from the backup?`)) return;
-      db = { ...data, active: data.active || db.active, sync: db.sync };
-    } else {
-      if (!confirm(`Merge ${summary} from the backup into this device? Nothing here is removed.`)) return;
-      applyMerged(mergeData(db, data));
-    }
-    commit();
-    alert('Backup imported.');
-    go('#/');
-  } catch (err) {
-    alert('Import failed: ' + err.message);
-  }
 }
 
 /* =========================================================================
@@ -2000,7 +1795,6 @@ const actions = {
     const w = db.workouts.find((x) => x.id === el.dataset.id);
     if (!confirm(`Delete "${w.name}"? Your logged history for it is kept.`)) return;
     db.workouts = db.workouts.filter((x) => x.id !== w.id);
-    db.deleted[w.id] = Date.now();
     commit();
     renderHome();
   },
@@ -2102,38 +1896,13 @@ const actions = {
   'delete-session'(el) {
     if (!confirm('Delete this workout from your history?')) return;
     db.history = db.history.filter((s) => s.id !== el.dataset.id);
-    db.deleted[el.dataset.id] = Date.now();
     commit();
     go('#/history');
   },
 
-  'sync-connect'() {
-    const token = document.getElementById('sync-token').value.trim();
-    if (!token) return alert('Paste a GitHub token first.');
-    db.sync = { ...db.sync, token, gistId: '', error: '', auto: true };
-    save();
-    renderSettings();
-    syncNow(false);
-  },
-  'sync-now': () => syncNow(false),
   'sheet-send': () => pushToSheet(false),
   'lock-app'() {
     if (confirm('Lock Trackfit on this device? You will need the password to open it again.')) signOut('');
-  },
-  'sync-disconnect'() {
-    if (!confirm('Stop syncing this device? Your data stays here and in the gist.')) return;
-    db.sync = emptyDb().sync;
-    save();
-    renderSettings();
-  },
-  export: exportData,
-  wipe() {
-    if (!confirm('Erase ALL workouts and history from this device? This cannot be undone.')) return;
-    if (!confirm('Are you sure? Consider exporting a backup first.')) return;
-    db = emptyDb(); // also disconnects sync, so the gist copy is left untouched
-    selectedId = null;
-    save();
-    go('#/');
   },
 };
 
@@ -2200,12 +1969,6 @@ document.addEventListener('change', (e) => {
   } else if (t.dataset.meta === 'muscle') {
     setMeta(t.dataset.name, { muscle: t.value });
     commit();
-  } else if (t.dataset.sync === 'auto') {
-    db.sync.auto = t.checked;
-    save();
-  } else if (t.dataset.import && t.files[0]) {
-    importData(t.files[0], t.dataset.import);
-    t.value = '';
   }
 });
 
@@ -2230,7 +1993,6 @@ document.addEventListener('keydown', (e) => {
 window.addEventListener('hashchange', () => route());
 route();
 
-if (db.sync.token && db.sync.auto) setTimeout(() => syncNow(true), 1500);
 if (db.auth.hash) {
   verifySession();
   if (db.sheets.dirty) setTimeout(() => pushToSheet(true), 2500);

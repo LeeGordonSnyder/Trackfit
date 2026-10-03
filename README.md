@@ -26,8 +26,6 @@ A personal workout tracker that runs in your browser. Build workouts in a table,
 
 **Your data**
 - lb/kg, bar weight, and the auto-increase step in Settings.
-- **Backup:** export to a JSON file. Imports can *merge* into or *replace* what's on the device.
-- **Sync across devices (optional, off by default):** paste a GitHub token that only has the `gist` permission, on each device. Data syncs through a secret gist in *your* GitHub account. For each workout or session, the most recent edit wins, and deletions sync too.
 - **Google Sheets (live):** every set, session, workout and exercise goes into the Trackfit sheet seconds after you log it, through an Apps Script in that sheet.
 - **Password lock:** the site opens on a lock screen. The password is cell **Z100** of the sheet's Workouts tab, and changing it signs out every device. Details and setup: [`google-sheets/README.md`](google-sheets/README.md).
 - Works offline and installs to your home screen (PWA).
@@ -40,4 +38,4 @@ It's a static site: `index.html`, `styles.css` and `app.js`, with no build step.
 - **Locally:** `python3 -m http.server` in this folder, then open http://localhost:8000
 - **On your phone:** host it with GitHub Pages (repo Settings → Pages → deploy from this branch). Open the URL in Safari/Chrome and choose *Add to Home Screen*.
 
-> Data lives in the browser you use it in. Export a backup now and then, or turn on sync.
+> The app works from the data on your phone, and every change is copied to the Google Sheet as you go.
