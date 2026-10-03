@@ -3,7 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#0f1115">
+  <meta name="theme-color" content="#0b0b0d">
+  <meta name="color-scheme" content="dark">
   <meta name="description" content="Personal workout tracker. Build workouts, execute them at the gym, and log every set. Data stays on your device.">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -12,16 +13,17 @@
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" href="icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="icon.svg">
+  <link rel="preload" href="fonts/barlow-condensed-700.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
   <main id="app" class="container" aria-live="polite"></main>
 
   <nav class="tabbar" aria-label="Main">
-    <a href="#/" data-tab="home"><span aria-hidden="true">🏋️</span>Workouts</a>
-    <a href="#/history" data-tab="history"><span aria-hidden="true">📅</span>History</a>
-    <a href="#/progress" data-tab="progress"><span aria-hidden="true">📈</span>Progress</a>
-    <a href="#/settings" data-tab="settings"><span aria-hidden="true">⚙️</span>Settings</a>
+    <a href="#/" data-tab="home"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true"><path d="M6.5 6.5v11M17.5 6.5v11M3 9.5v5M21 9.5v5M6.5 12h11"/></svg>Workouts</a>
+    <a href="#/history" data-tab="history"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true"><path d="M3.5 5.5h17v15h-17zM3.5 10h17M8 3v4M16 3v4"/></svg>History</a>
+    <a href="#/progress" data-tab="progress"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter" aria-hidden="true"><path d="M3 20.5h18M4 16l5-5 4 3 7-8M15 6h5v5"/></svg>Progress</a>
+    <a href="#/settings" data-tab="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true"><path d="M4 6h10M18 6h2M4 12h3M11 12h9M4 18h12M20 18h0"/><path d="M14 4v4M7 10v4M16 16v4"/></svg>Settings</a>
   </nav>
 
   <dialog id="modal" class="modal"><div id="modal-body"></div></dialog>

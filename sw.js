@@ -1,7 +1,8 @@
 // Offline support: try the network first (so updates show up), fall back to the cache
 // when offline or when the gym's signal is too slow.
-const CACHE = 'trackfit-v2';
-const ASSETS = ['./', './index.html', './styles.css', './app.js', './manifest.webmanifest', './icon.svg'];
+const CACHE = 'trackfit-v3';
+const ASSETS = ['./', './index.html', './styles.css', './app.js', './manifest.webmanifest', './icon.svg',
+  ...['barlow-400', 'barlow-500', 'barlow-600', 'barlow-700', 'barlow-condensed-600', 'barlow-condensed-700', 'barlow-condensed-800'].map((f) => `./fonts/${f}.woff2`)];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)).then(() => self.skipWaiting()));

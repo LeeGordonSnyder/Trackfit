@@ -11,6 +11,7 @@ const MUSCLES = ['Chest', 'Back', 'Shoulders', 'Biceps', 'Triceps', 'Legs', 'Glu
 const PLATES = { lb: [45, 35, 25, 10, 5, 2.5], kg: [25, 20, 15, 10, 5, 2.5, 1.25] };
 const DEFAULT_SETTINGS = { unit: 'lb', restSeconds: 90, barLb: 45, barKg: 20, stepLb: 5, stepKg: 2.5, updatedAt: 0 };
 
+const LINK_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true"><path d="M10 14l4-4M8.5 11.5l-2 2a3.5 3.5 0 0 0 5 5l2-2M15.5 12.5l2-2a3.5 3.5 0 0 0-5-5l-2 2"/></svg>';
 const app = document.getElementById('app');
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 const norm = (s) => String(s).trim().toLowerCase().replace(/\s+/g, ' ');
@@ -398,7 +399,7 @@ function renderHome() {
 
   app.innerHTML = `
     <header class="page-head">
-      <h1>Workouts</h1>
+      <div><p class="brand">TRACK<span>FIT</span></p><h1>Workouts</h1></div>
       <a class="btn primary" href="#/new">+ New</a>
     </header>
     ${banner}
@@ -504,7 +505,7 @@ function renderBuilder(id) {
     </div>
     <button class="btn block" data-action="add-row">+ Add exercise</button>
     <p class="help">Reps can be a number, a range like <b>8-12</b>, or a time like <b>45s</b> for timed exercises (planks, carries).
-      Tap <b>🔗</b> to superset an exercise with the one below it, so you alternate sets between them.</p>
+      Tap ${LINK_ICON.replace('<svg', '<svg class="icon-inline"')} to superset an exercise with the one below it, so you alternate sets between them.</p>
     <datalist id="ex-names">${[...exerciseCatalog().values()].sort().map((n) => `<option value="${esc(n)}">`).join('')}</datalist>
     <div class="sticky-actions">
       <button class="btn primary big block" data-action="save-workout">Save workout</button>
@@ -530,7 +531,7 @@ function renderRows() {
             <button data-action="row-up" aria-label="Move up" ${i === 0 ? 'disabled' : ''}>▲</button>
             <button data-action="row-down" aria-label="Move down" ${i === last ? 'disabled' : ''}>▼</button>
           </span>
-          <button data-action="row-link" class="link-btn ${e.link ? 'on' : ''}" aria-pressed="${e.link}" aria-label="Superset with next exercise" ${i === last ? 'disabled' : ''}>🔗</button>
+          <button data-action="row-link" class="link-btn ${e.link ? 'on' : ''}" aria-pressed="${e.link}" aria-label="Superset with next exercise" ${i === last ? 'disabled' : ''}>${LINK_ICON}</button>
           <button data-action="row-del" class="del" aria-label="Remove">✕</button>
         </td>
       </tr>`;
