@@ -28,6 +28,7 @@ A personal workout tracker that runs in your browser. Build workouts in a table,
 - lb/kg, bar weight, and the auto-increase step in Settings.
 - **Backup:** export to a JSON file. Imports can *merge* into or *replace* what's on the device.
 - **Sync across devices (optional, off by default):** paste a GitHub token that only has the `gist` permission, on each device. Data syncs through a secret gist in *your* GitHub account. For each workout or session, the most recent edit wins, and deletions sync too.
+- **Google Sheets (optional, live):** every set, session, workout and exercise goes into your own sheet seconds after you log it, through an Apps Script in that sheet. Setup: [`google-sheets/README.md`](google-sheets/README.md).
 - Works offline and installs to your home screen (PWA).
 - Dark theme with sunset-yellow accents. Fonts: Barlow / Barlow Condensed (SIL Open Font License, bundled in `fonts/`).
 

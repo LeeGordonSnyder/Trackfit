@@ -128,6 +128,7 @@ function emptyDb() {
     active: null, // the session currently being executed (never synced)
     settings: { ...DEFAULT_SETTINGS },
     sync: { token: '', gistId: '', lastSync: 0, auto: true, error: '' }, // device-only
+    sheets: { url: '', key: '', lastPush: 0, dirty: false, error: '' }, // device-only
   };
 }
 
@@ -159,6 +160,7 @@ function migrate(d) {
   out.active = d.active || null;
   out.settings = { ...DEFAULT_SETTINGS, ...(d.settings || {}) };
   out.sync = { ...out.sync, ...(d.sync || {}) };
+  out.sheets = { ...out.sheets, ...(d.sheets || {}) };
   return out;
 }
 
@@ -184,6 +186,7 @@ function save() {
 function commit() {
   save();
   scheduleSync();
+  schedulePush();
 }
 
 let db = load();
@@ -611,6 +614,7 @@ function renderRun() {
   const perf = lastPerformance(ex.name);
   const target = targetFor(ex, a.unit);
   const note = getMeta(ex.name).note;
+  const undoFrom = lastLoggedIndex(a);
 
   let hint = '';
   if (perf || target) {
@@ -686,7 +690,8 @@ function renderRun() {
         <button class="btn small" data-action="rest-skip">Skip</button>
       </div>
 
-      ${ex.sets.length ? `${setsList(ex.sets, a.unit)}<button class="link" data-action="undo-set">Undo last set</button>` : ''}
+      ${ex.sets.length ? setsList(ex.sets, a.unit) : ''}
+      ${undoFrom >= 0 ? `<button class="link" data-action="undo-set">Undo last set${undoFrom !== a.index ? ` (${esc(a.exercises[undoFrom].name)})` : ''}</button>` : ''}
 
       <div class="run-nav">
         <button class="btn big" data-action="prev-ex" ${a.index === 0 ? 'disabled' : ''}>‹ Prev</button>
@@ -701,6 +706,20 @@ function renderRun() {
   updateHoldUI();
   startTicker();
   requestWakeLock();
+}
+
+// The exercise holding the most recently logged set, or -1.
+function lastLoggedIndex(a) {
+  let best = -1;
+  let at = -1;
+  a.exercises.forEach((e, i) => {
+    const last = e.sets[e.sets.length - 1];
+    if (last && (last.at || 0) >= at) {
+      at = last.at || 0;
+      best = i;
+    }
+  });
+  return best;
 }
 
 function setLabel(sets, i) {
@@ -803,6 +822,7 @@ function logSet(difficulty) {
     if (navigator.vibrate) navigator.vibrate([60, 60, 60, 60, 120]);
   } else if (navigator.vibrate) navigator.vibrate(30);
   save();
+  schedulePush(true);
   renderRun();
 }
 
@@ -861,7 +881,15 @@ function finishWorkout() {
     finishedAt: now,
     updatedAt: now,
     note: '',
-    exercises: logged.map((e) => ({ name: e.name, targetSets: e.targetSets, targetReps: e.targetReps, timed: e.timed, sets: e.sets })),
+    exercises: logged.map((e) => ({
+      name: e.name,
+      targetSets: e.targetSets,
+      targetReps: e.targetReps,
+      timed: e.timed,
+      slot: a.exercises.indexOf(e),
+      superset: groupMembers(a, e.group).length > 1 ? supersetLetter(a, e.group) : '',
+      sets: e.sets,
+    })),
   };
   session.progressions = applyProgression(session);
   db.history.push(session);
@@ -874,6 +902,7 @@ function discardWorkout(skipConfirm) {
   if (!skipConfirm && !confirm('Discard this workout? Logged sets will be lost.')) return;
   db.active = null;
   save();
+  schedulePush();
   go('#/');
 }
 
@@ -1581,7 +1610,153 @@ function setSyncStatus(text) {
   if (el) el.textContent = text;
 }
 
-window.addEventListener('online', () => scheduleSync());
+window.addEventListener('online', () => {
+  scheduleSync();
+  if (db.sheets.dirty) schedulePush(true);
+});
+
+/* =========================================================================
+   Google Sheets (optional): live rows sent to an Apps Script web app in the user's sheet.
+   Column order must match TABS in google-sheets/Code.gs.
+   ========================================================================= */
+
+const TARGET_REASONS = { up: 'All Easy → up', hold: 'Had a Hard set → hold', same: 'Repeat' };
+
+function sheetTabs() {
+  const sets = [];
+  const sessions = [];
+  const sessionRows = (s, live) => {
+    s.exercises.forEach((e, ei) => {
+      const slot = e.slot ?? ei;
+      let n = 0;
+      e.sets.forEach((x, si) => {
+        if (!x.warmup) n++;
+        const timed = x.seconds != null;
+        sets.push([
+          `${s.id}-${slot + 1}-${si + 1}`, x.at || s.finishedAt || s.startedAt, s.id, s.workoutName, e.name, muscleOf(e.name),
+          x.warmup ? '' : n, x.warmup ? 'yes' : '', Number(x.weight) || 0, s.unit,
+          timed ? '' : x.reps, timed ? x.seconds : '', cap(x.difficulty),
+          timed ? '' : Math.round(epley(Number(x.weight) || 0, x.reps) * 10) / 10,
+          timed || x.warmup ? '' : (Number(x.weight) || 0) * (Number(x.reps) || 0),
+          (x.pr || []).join(', '), e.superset || '', x.at || s.finishedAt || s.startedAt,
+        ]);
+      });
+    });
+    const work = s.exercises.flatMap(workSets);
+    const count = (d) => work.filter((x) => x.difficulty === d).length;
+    const volume = work.reduce((sum, x) => sum + (x.seconds != null ? 0 : (Number(x.weight) || 0) * (Number(x.reps) || 0)), 0);
+    sessions.push([
+      s.id, s.startedAt, s.workoutName, s.startedAt, live ? '' : s.finishedAt,
+      live ? '' : Math.round((s.finishedAt - s.startedAt) / 60000), s.exercises.filter((e) => e.sets.length).length,
+      work.length, Math.round(volume), s.unit, work.filter((x) => x.pr && x.pr.length).length,
+      count('easy'), count('medium'), count('hard'),
+      (s.progressions || []).map((u) => `${u.name} ${fmtNum(u.from)}→${fmtNum(u.to)}`).join('; '),
+      live ? 'In progress' : s.note || '', live ? Date.now() : s.updatedAt || s.finishedAt,
+    ]);
+  };
+  for (const s of db.history) sessionRows(s, false);
+  if (db.active) {
+    const a = db.active;
+    sessionRows({
+      ...a,
+      exercises: a.exercises.map((e, i) => ({
+        ...e,
+        slot: i,
+        superset: groupMembers(a, e.group).length > 1 ? supersetLetter(a, e.group) : '',
+      })),
+    }, true);
+  }
+
+  const workouts = [];
+  for (const w of db.workouts) {
+    w.exercises.forEach((e, i) => {
+      workouts.push([e.id, w.id, w.name, i + 1, e.name, e.sets, String(e.reps), parseTime(e.reps) != null ? 'yes' : '', e.link ? 'yes' : '', w.updatedAt || w.createdAt || 0]);
+    });
+  }
+
+  const unit = db.settings.unit;
+  const exercises = [];
+  for (const [key, name] of exerciseCatalog()) {
+    const log = exerciseLog(key);
+    const b = bestsFrom(log);
+    const meta = db.meta[key] || {};
+    const timed = log.some((en) => en.sets.some((x) => x.seconds != null));
+    const target = timed ? null : targetFor({ name, timed }, unit);
+    exercises.push([
+      name, muscleOf(name), meta.note || '',
+      b.weight ? convertForBar(b.weight, 'kg', unit) : '', b.e1rm ? Math.round(convert(b.e1rm, 'kg', unit)) : '',
+      b.seconds || '', target ? target.weight : '', unit, target ? TARGET_REASONS[target.reason] || '' : '',
+      log.length ? log[log.length - 1].date : '', log.length, meta.updatedAt || (log.length ? log[log.length - 1].date : 0),
+    ]);
+  }
+  return { SetLog: sets, Sessions: sessions, Workouts: workouts, Exercises: exercises };
+}
+
+let pushing = false;
+let pushAgain = false;
+let pushTimer = null;
+
+function schedulePush(fast) {
+  if (!db.sheets.url) return;
+  db.sheets.dirty = true;
+  save();
+  clearTimeout(pushTimer);
+  pushTimer = setTimeout(() => pushToSheet(true), fast ? 1500 : 4000);
+}
+
+async function pushToSheet(quiet) {
+  if (!db.sheets.url) return;
+  if (pushing) {
+    pushAgain = true; // a change arrived mid-send: send again right after
+    return;
+  }
+  if (!navigator.onLine) {
+    if (!quiet) toast('Offline — will send to the sheet when you reconnect.');
+    return;
+  }
+  pushing = true;
+  pushAgain = false;
+  setSheetStatus('Sending…');
+  try {
+    const res = await fetch(db.sheets.url, {
+      method: 'POST',
+      // text/plain avoids a CORS preflight, which Apps Script web apps don't answer.
+      body: JSON.stringify({ app: 'trackfit', key: db.sheets.key, sentAt: Date.now(), tabs: sheetTabs() }),
+    });
+    let out;
+    try {
+      out = await res.json();
+    } catch {
+      throw new Error('Unexpected reply. Check the web app URL ends in /exec and access is set to "Anyone".');
+    }
+    if (!out.ok) throw new Error(out.error || 'The sheet rejected the data.');
+    db.sheets.lastPush = Date.now();
+    db.sheets.dirty = pushAgain;
+    db.sheets.error = '';
+    save();
+    if (!quiet) toast(`✓ Sent to Google Sheets · ${plural((out.counts && out.counts.SetLog) || 0, 'set')}`);
+  } catch (err) {
+    db.sheets.error = err.message === 'Failed to fetch' ? 'Could not reach the sheet (offline, or wrong URL).' : err.message;
+    save();
+    if (!quiet) toast('Google Sheets: ' + esc(db.sheets.error), 5000);
+  } finally {
+    pushing = false;
+    if (pushAgain) schedulePush(true);
+    setSheetStatus();
+  }
+}
+
+function setSheetStatus(text) {
+  const el = document.getElementById('sheet-status');
+  if (!el) return;
+  const sh = db.sheets;
+  el.textContent = text || (sh.error ? sh.error : sh.lastPush ? 'Last sent ' + fmtAgo(sh.lastPush) : 'Not sent yet');
+  const tag = document.getElementById('sheet-tag');
+  if (tag && !text) {
+    tag.className = 'tag ' + (sh.error ? 'hard' : 'easy');
+    tag.textContent = sh.error ? 'Problem' : 'Live';
+  }
+}
 
 /* =========================================================================
    Settings & backup
@@ -1603,6 +1778,20 @@ function renderSettings() {
        <label class="field"><span>GitHub token</span><input id="sync-token" type="password" autocomplete="off" placeholder="ghp_… or github_pat_…"></label>
        <button class="btn primary block" data-action="sync-connect">Connect &amp; sync</button>
        <p class="muted small-note">Your data goes to a <b>secret gist</b> in your GitHub account: unlisted, but anyone with its exact link can read it. The token is stored only in this browser and can only touch gists.</p>`;
+
+  const sh = db.sheets;
+  const sheetSection = sh.url
+    ? `<p><span class="tag ${sh.error ? 'hard' : 'easy'}" id="sheet-tag">${sh.error ? 'Problem' : 'Live'}</span>
+         <span class="muted" id="sheet-status">${sh.error ? esc(sh.error) : sh.lastPush ? 'Last sent ' + fmtAgo(sh.lastPush) : 'Not sent yet'}</span></p>
+       <div class="row gap"><button class="btn" data-action="sheet-send">⟳ Send now</button><button class="btn danger" data-action="sheet-disconnect">Disconnect</button></div>`
+    : `<ol class="steps">
+         <li>In your sheet: <b>Extensions → Apps Script</b>. Paste in <b>google-sheets/Code.gs</b> from the Trackfit repo and save.</li>
+         <li>Run <b>setup</b> once and allow access. The log shows your <b>key</b>.</li>
+         <li><b>Deploy → New deployment → Web app</b>, execute as <b>Me</b>, access <b>Anyone</b>. Copy the URL.</li>
+       </ol>
+       <label class="field"><span>Web app URL</span><input id="sheet-url" type="url" autocomplete="off" placeholder="https://script.google.com/macros/s/…/exec"></label>
+       <label class="field"><span>Key</span><input id="sheet-key" type="password" autocomplete="off" placeholder="From the setup log"></label>
+       <button class="btn primary block" data-action="sheet-connect">Connect &amp; send</button>`;
 
   app.innerHTML = `
     <header class="page-head"><h1>Settings</h1></header>
@@ -1626,6 +1815,12 @@ function renderSettings() {
         </div>
         <p class="muted small-note">When every working set of an exercise felt Easy, its target for next time goes up by the auto-increase amount.</p>
         <button class="btn block" data-action="plates-standalone" style="margin-top:12px">🧮 Plate calculator</button>
+      </section>
+
+      <section class="card">
+        <h2>Google Sheets <small class="muted">(optional)</small></h2>
+        <p class="muted">Live log of every set, session, workout and exercise in your own Google Sheet, updated seconds after each set.</p>
+        <div class="stack">${sheetSection}</div>
       </section>
 
       <section class="card">
@@ -1746,8 +1941,10 @@ const actions = {
   },
   'undo-set'() {
     const a = db.active;
-    const ex = a.exercises[a.index];
-    const removed = ex.sets.pop();
+    const i = lastLoggedIndex(a);
+    if (i < 0) return;
+    if (i !== a.index) setIndex(i); // supersets may have moved on: go back to where the set was logged
+    const removed = a.exercises[i].sets.pop();
     if (removed) {
       a.pendingWeight = String(removed.weight);
       a.pendingReps = String(removed.seconds != null ? removed.seconds : removed.reps);
@@ -1755,6 +1952,7 @@ const actions = {
     }
     a.restEndsAt = null;
     save();
+    schedulePush(true);
     renderRun();
   },
   'rest-add'() {
@@ -1821,6 +2019,25 @@ const actions = {
     syncNow(false);
   },
   'sync-now': () => syncNow(false),
+  'sheet-connect'() {
+    const url = document.getElementById('sheet-url').value.trim();
+    const key = document.getElementById('sheet-key').value.trim();
+    if (!/^https:\/\/script\.google\.com\/macros\/s\/[\w-]+\/exec$/.test(url)) {
+      return alert('Paste the web app URL from Deploy → New deployment. It starts with https://script.google.com/macros/s/ and ends with /exec.');
+    }
+    if (!key) return alert('Paste the key from the setup log.');
+    db.sheets = { ...db.sheets, url, key, error: '', dirty: true };
+    save();
+    renderSettings();
+    pushToSheet(false);
+  },
+  'sheet-send': () => pushToSheet(false),
+  'sheet-disconnect'() {
+    if (!confirm('Stop sending to Google Sheets? Rows already in the sheet stay there.')) return;
+    db.sheets = emptyDb().sheets;
+    save();
+    renderSettings();
+  },
   'sync-disconnect'() {
     if (!confirm('Stop syncing this device? Your data stays here and in the gist.')) return;
     db.sync = emptyDb().sync;
@@ -1925,6 +2142,7 @@ window.addEventListener('hashchange', () => route());
 route();
 
 if (db.sync.token && db.sync.auto) setTimeout(() => syncNow(true), 1500);
+if (db.sheets.url && db.sheets.dirty) setTimeout(() => pushToSheet(true), 2500);
 
 if ('serviceWorker' in navigator && location.protocol !== 'file:') {
   navigator.serviceWorker.register('sw.js').catch(() => {});
