@@ -5,6 +5,8 @@
    ========================================================================= */
 
 const STORE_KEY = 'trackfit:v1';
+// The Apps Script web app attached to the Trackfit sheet. It rejects anything without the password.
+const SHEET_URL = 'https://script.google.com/macros/s/AKfycbx71NmUZdOI1tereW-LWlX9UOhbsv32yLI-v7gkR-VRn3BmkWfo1mvH7NaXqSXNYGDO/exec';
 const SYNC_FILE = 'trackfit-data.json';
 const KG_PER_LB = 0.45359237;
 const MUSCLES = ['Chest', 'Back', 'Shoulders', 'Biceps', 'Triceps', 'Legs', 'Glutes', 'Core', 'Cardio', 'Full body', 'Other'];
@@ -128,7 +130,8 @@ function emptyDb() {
     active: null, // the session currently being executed (never synced)
     settings: { ...DEFAULT_SETTINGS },
     sync: { token: '', gistId: '', lastSync: 0, auto: true, error: '' }, // device-only
-    sheets: { url: '', key: '', lastPush: 0, dirty: false, error: '' }, // device-only
+    sheets: { lastPush: 0, dirty: false, error: '' }, // device-only
+    auth: { hash: '', at: 0 }, // device-only: SHA-256 of the password in Workouts!Z100
   };
 }
 
@@ -161,6 +164,7 @@ function migrate(d) {
   out.settings = { ...DEFAULT_SETTINGS, ...(d.settings || {}) };
   out.sync = { ...out.sync, ...(d.sync || {}) };
   out.sheets = { ...out.sheets, ...(d.sheets || {}) };
+  out.auth = { ...out.auth, ...(d.auth || {}) };
   return out;
 }
 
@@ -319,6 +323,15 @@ function currentView() {
 function route(keepScroll) {
   const [view = '', rawId] = location.hash.replace(/^#\/?/, '').split('/');
   const id = rawId ? decodeURIComponent(rawId) : rawId;
+  const locked = !db.auth.hash;
+  document.body.classList.toggle('locked', locked);
+  if (locked) {
+    stopTicker();
+    releaseWakeLock();
+    document.body.classList.remove('running');
+    renderLock();
+    return;
+  }
   stopTicker();
   if (keepScroll !== true) {
     window.scrollTo(0, 0);
@@ -1697,15 +1710,41 @@ let pushAgain = false;
 let pushTimer = null;
 
 function schedulePush(fast) {
-  if (!db.sheets.url) return;
   db.sheets.dirty = true;
   save();
+  if (!db.auth.hash) return; // sent after the next sign-in
   clearTimeout(pushTimer);
   pushTimer = setTimeout(() => pushToSheet(true), fast ? 1500 : 4000);
 }
 
+async function callSheet(body) {
+  const res = await fetch(SHEET_URL, {
+    method: 'POST',
+    // text/plain avoids a CORS preflight, which Apps Script web apps don't answer.
+    body: JSON.stringify({ app: 'trackfit', sentAt: Date.now(), ...body }),
+  });
+  try {
+    return await res.json();
+  } catch {
+    throw new Error('The sheet sent an unexpected reply. Check the Apps Script deployment allows access to "Anyone".');
+  }
+}
+
+function sheetError(err) {
+  if (err.message === 'Failed to fetch') return "Can't reach the sheet. Check your connection.";
+  if (/\bkey\b/i.test(err.message)) return "The sheet's script is out of date: paste the new Code.gs into Apps Script and deploy a new version.";
+  return err.message;
+}
+
+// Password changed or removed in the sheet: lock this device until the new one is entered.
+function handleAuthFailure(out) {
+  if (out.code !== 'auth' && out.code !== 'nopassword') return false;
+  signOut(out.code === 'auth' ? 'The password was changed. Enter the new one.' : out.error);
+  return true;
+}
+
 async function pushToSheet(quiet) {
-  if (!db.sheets.url) return;
+  if (!db.auth.hash) return;
   if (pushing) {
     pushAgain = true; // a change arrived mid-send: send again right after
     return;
@@ -1718,33 +1757,98 @@ async function pushToSheet(quiet) {
   pushAgain = false;
   setSheetStatus('Sending…');
   try {
-    const res = await fetch(db.sheets.url, {
-      method: 'POST',
-      // text/plain avoids a CORS preflight, which Apps Script web apps don't answer.
-      body: JSON.stringify({ app: 'trackfit', key: db.sheets.key, sentAt: Date.now(), tabs: sheetTabs() }),
-    });
-    let out;
-    try {
-      out = await res.json();
-    } catch {
-      throw new Error('Unexpected reply. Check the web app URL ends in /exec and access is set to "Anyone".');
+    const out = await callSheet({ passwordHash: db.auth.hash, tabs: sheetTabs() });
+    if (!out.ok) {
+      if (handleAuthFailure(out)) return;
+      throw new Error(out.error || 'The sheet rejected the data.');
     }
-    if (!out.ok) throw new Error(out.error || 'The sheet rejected the data.');
     db.sheets.lastPush = Date.now();
     db.sheets.dirty = pushAgain;
     db.sheets.error = '';
     save();
     if (!quiet) toast(`✓ Sent to Google Sheets · ${plural((out.counts && out.counts.SetLog) || 0, 'set')}`);
   } catch (err) {
-    db.sheets.error = err.message === 'Failed to fetch' ? 'Could not reach the sheet (offline, or wrong URL).' : err.message;
+    db.sheets.error = sheetError(err);
     save();
     if (!quiet) toast('Google Sheets: ' + esc(db.sheets.error), 5000);
   } finally {
     pushing = false;
-    if (pushAgain) schedulePush(true);
+    if (pushAgain && db.auth.hash) schedulePush(true);
     setSheetStatus();
   }
 }
+
+/* ---- Password lock (password lives in Workouts!Z100) ---- */
+
+let lockMessage = '';
+let lastVerify = 0;
+
+async function hashPassword(text) {
+  const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return [...new Uint8Array(bytes)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function renderLock() {
+  app.innerHTML = `
+    <div class="lock">
+      <p class="brand">TRACK<span>FIT</span></p>
+      <h1>Locked</h1>
+      <p class="muted">Enter your password to open Trackfit.</p>
+      <form id="lock-form" class="stack">
+        <input id="lock-pass" type="password" autocomplete="current-password" placeholder="Password" aria-label="Password">
+        <p class="need" id="lock-msg" role="alert">${esc(lockMessage)}</p>
+        <button class="btn primary big block" type="submit" id="lock-btn">Unlock</button>
+      </form>
+    </div>`;
+  document.getElementById('lock-pass').focus();
+}
+
+async function unlock() {
+  const input = document.getElementById('lock-pass');
+  const msg = document.getElementById('lock-msg');
+  const btn = document.getElementById('lock-btn');
+  const password = input.value.trim();
+  if (!password) return input.focus();
+  btn.disabled = true;
+  msg.textContent = 'Checking…';
+  try {
+    const hash = await hashPassword(password);
+    const out = await callSheet({ action: 'login', passwordHash: hash });
+    if (!out.ok) throw new Error(out.error || 'Wrong password.');
+    db.auth = { hash, at: Date.now() };
+    lockMessage = '';
+    lastVerify = Date.now();
+    save();
+    route();
+    if (db.sheets.dirty || !db.sheets.lastPush) schedulePush(true);
+  } catch (err) {
+    msg.textContent = sheetError(err);
+    btn.disabled = false;
+    input.select();
+  }
+}
+
+function signOut(message) {
+  db.auth = emptyDb().auth;
+  lockMessage = message || '';
+  closeModal();
+  save();
+  route();
+}
+
+// Re-check the password with the sheet now and then; offline, the app keeps working.
+async function verifySession() {
+  if (!db.auth.hash || !navigator.onLine || Date.now() - lastVerify < 5 * 60000) return;
+  lastVerify = Date.now();
+  try {
+    const out = await callSheet({ action: 'login', passwordHash: db.auth.hash });
+    if (!out.ok) handleAuthFailure(out);
+  } catch { /* unreachable: try again later */ }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') verifySession();
+});
 
 function setSheetStatus(text) {
   const el = document.getElementById('sheet-status');
@@ -1780,18 +1884,11 @@ function renderSettings() {
        <p class="muted small-note">Your data goes to a <b>secret gist</b> in your GitHub account: unlisted, but anyone with its exact link can read it. The token is stored only in this browser and can only touch gists.</p>`;
 
   const sh = db.sheets;
-  const sheetSection = sh.url
-    ? `<p><span class="tag ${sh.error ? 'hard' : 'easy'}" id="sheet-tag">${sh.error ? 'Problem' : 'Live'}</span>
-         <span class="muted" id="sheet-status">${sh.error ? esc(sh.error) : sh.lastPush ? 'Last sent ' + fmtAgo(sh.lastPush) : 'Not sent yet'}</span></p>
-       <div class="row gap"><button class="btn" data-action="sheet-send">⟳ Send now</button><button class="btn danger" data-action="sheet-disconnect">Disconnect</button></div>`
-    : `<ol class="steps">
-         <li>In your sheet: <b>Extensions → Apps Script</b>. Paste in <b>google-sheets/Code.gs</b> from the Trackfit repo and save.</li>
-         <li>Run <b>setup</b> once and allow access. The log shows your <b>key</b>.</li>
-         <li><b>Deploy → New deployment → Web app</b>, execute as <b>Me</b>, access <b>Anyone</b>. Copy the URL.</li>
-       </ol>
-       <label class="field"><span>Web app URL</span><input id="sheet-url" type="url" autocomplete="off" placeholder="https://script.google.com/macros/s/…/exec"></label>
-       <label class="field"><span>Key</span><input id="sheet-key" type="password" autocomplete="off" placeholder="From the setup log"></label>
-       <button class="btn primary block" data-action="sheet-connect">Connect &amp; send</button>`;
+  const sheetSection = `
+    <p><span class="tag ${sh.error ? 'hard' : 'easy'}" id="sheet-tag">${sh.error ? 'Problem' : 'Live'}</span>
+      <span class="muted" id="sheet-status">${sh.error ? esc(sh.error) : sh.lastPush ? 'Last sent ' + fmtAgo(sh.lastPush) : 'Not sent yet'}</span></p>
+    <div class="row gap"><button class="btn" data-action="sheet-send">⟳ Send now</button><button class="btn" data-action="lock-app">🔒 Lock app</button></div>
+    <p class="muted small-note">The password is cell <b>Z100</b> in the sheet's Workouts tab. Change it there and every device has to enter the new one.</p>`;
 
   app.innerHTML = `
     <header class="page-head"><h1>Settings</h1></header>
@@ -1818,8 +1915,8 @@ function renderSettings() {
       </section>
 
       <section class="card">
-        <h2>Google Sheets <small class="muted">(optional)</small></h2>
-        <p class="muted">Live log of every set, session, workout and exercise in your own Google Sheet, updated seconds after each set.</p>
+        <h2>Google Sheets</h2>
+        <p class="muted">Every set, session, workout and exercise goes to your Trackfit sheet seconds after you log it.</p>
         <div class="stack">${sheetSection}</div>
       </section>
 
@@ -2019,24 +2116,9 @@ const actions = {
     syncNow(false);
   },
   'sync-now': () => syncNow(false),
-  'sheet-connect'() {
-    const url = document.getElementById('sheet-url').value.trim();
-    const key = document.getElementById('sheet-key').value.trim();
-    if (!/^https:\/\/script\.google\.com\/macros\/s\/[\w-]+\/exec$/.test(url)) {
-      return alert('Paste the web app URL from Deploy → New deployment. It starts with https://script.google.com/macros/s/ and ends with /exec.');
-    }
-    if (!key) return alert('Paste the key from the setup log.');
-    db.sheets = { ...db.sheets, url, key, error: '', dirty: true };
-    save();
-    renderSettings();
-    pushToSheet(false);
-  },
   'sheet-send': () => pushToSheet(false),
-  'sheet-disconnect'() {
-    if (!confirm('Stop sending to Google Sheets? Rows already in the sheet stay there.')) return;
-    db.sheets = emptyDb().sheets;
-    save();
-    renderSettings();
+  'lock-app'() {
+    if (confirm('Lock Trackfit on this device? You will need the password to open it again.')) signOut('');
   },
   'sync-disconnect'() {
     if (!confirm('Stop syncing this device? Your data stays here and in the gist.')) return;
@@ -2127,6 +2209,13 @@ document.addEventListener('change', (e) => {
   }
 });
 
+document.addEventListener('submit', (e) => {
+  if (e.target.id === 'lock-form') {
+    e.preventDefault();
+    unlock();
+  }
+});
+
 // Enter in the builder adds a new row; Enter in the run inputs hides the keyboard.
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Enter') return;
@@ -2142,7 +2231,10 @@ window.addEventListener('hashchange', () => route());
 route();
 
 if (db.sync.token && db.sync.auto) setTimeout(() => syncNow(true), 1500);
-if (db.sheets.url && db.sheets.dirty) setTimeout(() => pushToSheet(true), 2500);
+if (db.auth.hash) {
+  verifySession();
+  if (db.sheets.dirty) setTimeout(() => pushToSheet(true), 2500);
+}
 
 if ('serviceWorker' in navigator && location.protocol !== 'file:') {
   navigator.serviceWorker.register('sw.js').catch(() => {});

@@ -4,10 +4,13 @@
  * Paste this into the sheet's Apps Script editor (Extensions → Apps Script), run `setup` once,
  * then deploy it as a web app. Full steps: google-sheets/README.md in the Trackfit repo.
  *
+ * Access: the app's password is whatever is in Workouts!Z100. Every request must carry a
+ * SHA-256 hash of it; change the cell and every device has to sign in again.
+ *
  * The app sends a full snapshot of its data. Each tab is matched on its first column (ID):
  * existing rows are updated in place, new ones are appended, and rows the app no longer has
- * (deleted workouts or sessions) are removed. Extra columns you add to the right of the
- * Trackfit columns are left alone.
+ * are removed. Only the Trackfit columns are written; whole rows are never inserted or
+ * deleted, so cells to the right (like Z100) stay exactly where they are.
  */
 
 const TABS = {
@@ -38,28 +41,17 @@ const TABS = {
 
 const DATE_FORMAT = 'M/d/yyyy';
 const TIME_FORMAT = 'M/d/yyyy H:mm:ss';
-const KEY_PROPERTY = 'TRACKFIT_KEY';
+const PASSWORD_SHEET = 'Workouts';
+const PASSWORD_CELL = 'Z100';
+const MAX_FAILS = 20; // wrong passwords allowed per 10 minutes before everyone is paused
 
-/** Run once from the editor: creates the tabs and prints the key to paste into Trackfit. */
+/** Run once from the editor: creates the tabs. Then type a password into Workouts!Z100. */
 function setup() {
-  const props = PropertiesService.getScriptProperties();
-  let key = props.getProperty(KEY_PROPERTY);
-  if (!key) {
-    key = Utilities.getUuid().replace(/-/g, '').slice(0, 24);
-    props.setProperty(KEY_PROPERTY, key);
-  }
   const ss = SpreadsheetApp.getActive();
   Object.keys(TABS).forEach((name) => ensureTab(ss, name));
   const blank = ss.getSheetByName('Sheet1');
   if (blank && ss.getSheets().length > 1 && blank.getLastRow() === 0) ss.deleteSheet(blank);
-  Logger.log('Trackfit key (paste this into Trackfit → Settings → Google Sheets): ' + key);
-  return key;
-}
-
-/** Run from the editor if the key ever leaks: the app will need the new one. */
-function resetKey() {
-  PropertiesService.getScriptProperties().deleteProperty(KEY_PROPERTY);
-  return setup();
+  Logger.log('Tabs ready. Set the app password in ' + PASSWORD_SHEET + '!' + PASSWORD_CELL + '.');
 }
 
 function doGet() {
@@ -69,9 +61,9 @@ function doGet() {
 function doPost(e) {
   try {
     const body = JSON.parse(e.postData.contents);
-    const key = PropertiesService.getScriptProperties().getProperty(KEY_PROPERTY);
-    if (!key) return json({ ok: false, error: 'Run setup in the Apps Script editor first.' });
-    if (body.key !== key) return json({ ok: false, error: 'Wrong key. Copy it again from the setup log.' });
+    const auth = checkPassword(body.passwordHash);
+    if (!auth.ok) return json(auth);
+    if (body.action === 'login') return json({ ok: true });
 
     const lock = LockService.getScriptLock();
     lock.waitLock(30000);
@@ -89,6 +81,26 @@ function doPost(e) {
   } catch (err) {
     return json({ ok: false, error: String((err && err.message) || err) });
   }
+}
+
+function checkPassword(hash) {
+  const cache = CacheService.getScriptCache();
+  const fails = Number(cache.get('fails') || 0);
+  if (fails >= MAX_FAILS) return { ok: false, code: 'paused', error: 'Too many wrong passwords. Try again in 10 minutes.' };
+  const sheet = SpreadsheetApp.getActive().getSheetByName(PASSWORD_SHEET);
+  const password = sheet ? String(sheet.getRange(PASSWORD_CELL).getDisplayValue()).trim() : '';
+  if (!password) return { ok: false, code: 'nopassword', error: 'No password set yet. Type one into cell ' + PASSWORD_CELL + ' of the ' + PASSWORD_SHEET + ' tab.' };
+  if (typeof hash !== 'string' || hash !== sha256Hex(password)) {
+    cache.put('fails', String(fails + 1), 600);
+    return { ok: false, code: 'auth', error: 'Wrong password.' };
+  }
+  return { ok: true };
+}
+
+function sha256Hex(text) {
+  return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, text, Utilities.Charset.UTF_8)
+    .map((b) => ((b + 256) % 256).toString(16).padStart(2, '0'))
+    .join('');
 }
 
 function json(obj) {
@@ -117,6 +129,15 @@ function toCells(spec, row) {
   });
 }
 
+// Last row with an ID in column A (other columns, like Z100, don't count).
+function lastIdRow(sheet) {
+  const max = sheet.getLastRow();
+  if (max < 2) return max;
+  const col = sheet.getRange(1, 1, max, 1).getValues();
+  for (let i = col.length - 1; i >= 0; i--) if (col[i][0] !== '' && col[i][0] != null) return i + 1;
+  return 0;
+}
+
 function syncTab(sheet, spec, rows) {
   const width = spec.headers.length;
   const incoming = new Map();
@@ -124,42 +145,34 @@ function syncTab(sheet, spec, rows) {
     if (Array.isArray(r) && r.length === width && r[0] !== '' && r[0] != null) incoming.set(normId(r[0]), toCells(spec, r));
   });
 
-  // 1. Remove rows the app no longer has, bottom-up so row numbers stay valid.
-  let last = sheet.getLastRow();
-  if (last > 1) {
-    const ids = sheet.getRange(2, 1, last - 1, 1).getValues().map((r) => normId(r[0]));
-    if (ids.every((id) => !incoming.has(id))) {
-      // Sheets refuses to delete every unfrozen row, so clear them instead.
-      sheet.getRange(2, 1, last - 1, sheet.getMaxColumns()).clearContent();
-    } else {
-      for (let i = ids.length - 1; i >= 0; i--) {
-        if (incoming.has(ids[i])) continue;
-        let j = i;
-        while (j > 0 && !incoming.has(ids[j - 1])) j--;
-        sheet.deleteRows(j + 2, i - j + 1);
-        i = j;
-      }
+  // Keep the sheet's current order: update rows that still exist, drop removed ones, append new ones.
+  const used = Math.max(1, lastIdRow(sheet));
+  const existing = used > 1 ? sheet.getRange(2, 1, used - 1, 1).getValues().map((r) => normId(r[0])) : [];
+  const out = [];
+  const seen = new Set();
+  existing.forEach((id) => {
+    if (incoming.has(id) && !seen.has(id)) {
+      out.push(incoming.get(id));
+      seen.add(id);
     }
-  }
-
-  // 2. Update existing rows in place, then append new ones.
-  last = sheet.getLastRow();
-  const existing = last > 1 ? sheet.getRange(2, 1, last - 1, 1).getValues().map((r) => normId(r[0])) : [];
-  const seen = new Set(existing);
-  const out = existing.map((id) => incoming.get(id));
+  });
   incoming.forEach((row, id) => {
     if (!seen.has(id)) out.push(row);
   });
-  if (!out.length) return 0;
 
   const needed = out.length + 1 - sheet.getMaxRows();
   if (needed > 0) sheet.insertRowsAfter(sheet.getMaxRows(), needed);
-  const format = (names, fmt) => (names || []).forEach((h) => {
-    sheet.getRange(2, spec.headers.indexOf(h) + 1, out.length, 1).setNumberFormat(fmt);
-  });
-  format(spec.dates, DATE_FORMAT);
-  format(spec.times, TIME_FORMAT);
-  format(spec.text, '@');
-  sheet.getRange(2, 1, out.length, width).setValues(out);
+  if (out.length) {
+    const format = (names, fmt) => (names || []).forEach((h) => {
+      sheet.getRange(2, spec.headers.indexOf(h) + 1, out.length, 1).setNumberFormat(fmt);
+    });
+    format(spec.dates, DATE_FORMAT);
+    format(spec.times, TIME_FORMAT);
+    format(spec.text, '@');
+    sheet.getRange(2, 1, out.length, width).setValues(out);
+  }
+  // Clear leftover Trackfit cells below (only Trackfit's columns).
+  const leftover = used - 1 - out.length;
+  if (leftover > 0) sheet.getRange(2 + out.length, 1, leftover, width).clearContent();
   return out.length;
 }

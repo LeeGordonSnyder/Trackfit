@@ -135,7 +135,8 @@ a { color: inherit; }
 }
 .tabbar a.active { color: var(--accent); }
 .tabbar a.active::before { transform: scaleX(1); }
-body.running .tabbar { display: none; }
+body.running .tabbar,
+body.locked .tabbar { display: none; }
 body.running .container { padding-bottom: calc(24px + env(safe-area-inset-bottom)); }
 
 /* ---------- Buttons ---------- */
@@ -845,3 +846,19 @@ body.running .toast { bottom: calc(24px + env(safe-area-inset-bottom)); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; }
 }
+
+/* ---------- Lock screen ---------- */
+.lock {
+  max-width: 360px;
+  margin: 18vh auto 0;
+  padding: 28px 22px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-top: 2px solid var(--accent);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+.lock h1 { margin: 2px 0 6px; }
+.lock > .muted { margin-bottom: 18px; }
+.lock input { font-size: 1.1rem; min-height: 52px; letter-spacing: .08em; }
+.lock .need { margin: 0; }

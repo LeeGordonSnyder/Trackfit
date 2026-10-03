@@ -2,27 +2,31 @@
 
 Trackfit can send everything to your own Google Sheet, live. A set appears a couple of seconds after you tap Easy / Medium / Hard. A workout in progress shows in **Sessions** as "In progress" with a blank END until you finish it. If you discard it, its rows are removed.
 
-Sending goes through a small Google Apps Script (`Code.gs`) that's attached to your sheet and runs under your Google account. Nothing goes through anyone else's server.
+Sending goes through a small Google Apps Script (`Code.gs`) that's attached to your sheet and runs under your Google account. Nothing goes through anyone else's server. The site is password-locked, and the password lives in the sheet (see below).
 
-## One-time setup (about 2 minutes)
+## Setup
 
-1. Open your sheet and go to **Extensions → Apps Script**.
-2. Delete what's in `Code.gs`, paste in this folder's [`Code.gs`](Code.gs), and press **Save**.
-3. Pick **setup** in the function dropdown and press **Run**. Allow access when Google asks. This creates the tabs (SetLog, Sessions, Workouts, Exercises). The **Execution log** then shows your **key**: copy it.
-4. Go to **Deploy → New deployment**, choose the gear icon → **Web app**, and set:
-   - **Execute as:** Me
-   - **Who has access:** Anyone
+1. Open your sheet and go to **Extensions → Apps Script**. Replace everything in `Code.gs` with this folder's [`Code.gs`](Code.gs), then press **Save**.
+2. Run **setup** once and allow access. It creates the tabs: SetLog, Sessions, Workouts and Exercises.
+3. Type a password into cell **Z100** of the **Workouts** tab.
+4. Deploy it. The web app's URL is built into Trackfit (`SHEET_URL` in `app.js`), so keep that same deployment:
+   - **First time:** go to **Deploy → New deployment → Web app**, with execute as **Me** and access for **Anyone**. Then put the new URL in `SHEET_URL`.
+   - **After changing `Code.gs`:** go to **Deploy → Manage deployments → ✏️ → Version: New version → Deploy**. The URL stays the same.
 
-   Press **Deploy** and copy the **Web app URL** (it ends in `/exec`).
-5. In Trackfit, open **Settings → Google Sheets**, paste the URL and the key, and press **Connect & send**.
+## Password
 
-"Anyone" means anyone who has the URL can reach the script. The script ignores every request that doesn't carry your key. If the key ever leaks, run **resetKey** in the editor and paste the new key into Trackfit.
-
-**Changed `Code.gs` later?** Go to **Deploy → Manage deployments → ✏️ → Version: New version → Deploy**. The URL stays the same.
+- Trackfit opens on a lock screen. The password is whatever is in **Workouts!Z100**.
+- The app never stores or sends the password itself, only its SHA-256 hash. The script hashes Z100 the same way and compares the two.
+- Every request without the right hash is refused. That's what protects the sheet, because the web app URL can be found in the page source of a public site.
+- **To change it,** edit Z100. Every device is asked for the new password the next time it reaches the sheet. Sets logged in the meantime stay on the phone and are sent after you sign in again.
+- An empty Z100 refuses everything.
+- After 20 wrong passwords in 10 minutes, the script pauses all sign-ins for 10 minutes.
+- The script only writes in Trackfit's own columns and never adds or deletes whole rows, so Z100 and anything else to the right stays where it is.
+- Anyone who can view the sheet can see Z100. You can hide column Z if you like (right-click → Hide column).
 
 ## Tabs
 
-Each row is matched on its first column. Existing rows are updated in place, new ones are added, and rows for things you deleted in the app are removed. You can add your own columns to the right of the Trackfit columns (formulas, comments) and they'll be left alone.
+Each row is matched on its first column. Existing rows are updated in place, new ones are added, and rows for things you deleted in the app are removed. Only Trackfit's own columns are written. Cells further right are never touched, but they stay on their row number, so they won't follow a Trackfit row if rows above it are removed.
 
 | Tab | One row per | Columns |
 |---|---|---|
