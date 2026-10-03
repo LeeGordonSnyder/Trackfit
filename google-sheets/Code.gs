@@ -7,6 +7,9 @@
  * Access: the app's password is whatever is in Workouts!Z100. Every request must carry a
  * SHA-256 hash of it; change the cell and every device has to sign in again.
  *
+ * On open, the app reads everything back ("pull") so the sheet is the source of truth;
+ * edits made in the sheet show up in the app.
+ *
  * The app sends a full snapshot of its data. Each tab is matched on its first column (ID):
  * existing rows are updated in place, new ones are appended, and rows the app no longer has
  * are removed. Only the Trackfit columns are written; whole rows are never inserted or
@@ -22,7 +25,7 @@ const TABS = {
   },
   Sessions: {
     headers: ['ID', 'DATE', 'WORKOUT', 'START', 'END', 'DURATION (MIN)', 'EXERCISES', 'WORKING SETS', 'VOLUME', 'UNIT',
-      'PRS', 'EASY', 'MEDIUM', 'HARD', 'NEXT TIME', 'NOTE', 'TIMESTAMP'],
+      'PRS', 'EASY', 'MEDIUM', 'HARD', 'NEXT TIME', 'NOTE', 'TIMESTAMP', 'WORKOUT ID'],
     dates: ['DATE'],
     times: ['START', 'END', 'TIMESTAMP'],
   },
@@ -64,6 +67,7 @@ function doPost(e) {
     const auth = checkPassword(body.passwordHash);
     if (!auth.ok) return json(auth);
     if (body.action === 'login') return json({ ok: true });
+    if (body.action === 'pull') return json({ ok: true, tabs: readTabs() });
 
     const lock = LockService.getScriptLock();
     lock.waitLock(30000);
@@ -127,6 +131,31 @@ function toCells(spec, row) {
     if (isTime) return typeof v === 'number' && v > 0 ? new Date(v) : '';
     return v === null || v === undefined ? '' : v;
   });
+}
+
+// Every Trackfit row of every tab, as objects keyed by header. Dates become epoch milliseconds.
+function readTabs() {
+  const ss = SpreadsheetApp.getActive();
+  const out = {};
+  Object.keys(TABS).forEach((name) => {
+    const spec = TABS[name];
+    const sheet = ss.getSheetByName(name);
+    const last = sheet ? lastIdRow(sheet) : 0;
+    if (last < 2) {
+      out[name] = [];
+      return;
+    }
+    out[name] = sheet.getRange(2, 1, last - 1, spec.headers.length).getValues()
+      .filter((r) => r[0] !== '' && r[0] != null)
+      .map((r) => {
+        const row = {};
+        spec.headers.forEach((h, i) => {
+          row[h] = r[i] instanceof Date ? r[i].getTime() : r[i];
+        });
+        return row;
+      });
+  });
+  return out;
 }
 
 // Last row with an ID in column A (other columns, like Z100, don't count).

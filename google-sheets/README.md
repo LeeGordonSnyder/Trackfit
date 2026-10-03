@@ -31,7 +31,7 @@ Each row is matched on its first column. Existing rows are updated in place, new
 | Tab | One row per | Columns |
 |---|---|---|
 | **SetLog** | set | ID, DATE, SESSION ID, WORKOUT, EXERCISE, MUSCLE, SET #, WARM-UP, WEIGHT, UNIT, REPS, SECONDS, DIFFICULTY, EST 1RM, VOLUME, PR, SUPERSET, TIMESTAMP |
-| **Sessions** | workout done | ID, DATE, WORKOUT, START, END, DURATION (MIN), EXERCISES, WORKING SETS, VOLUME, UNIT, PRS, EASY, MEDIUM, HARD, NEXT TIME, NOTE, TIMESTAMP |
+| **Sessions** | workout done | ID, DATE, WORKOUT, START, END, DURATION (MIN), EXERCISES, WORKING SETS, VOLUME, UNIT, PRS, EASY, MEDIUM, HARD, NEXT TIME, NOTE, TIMESTAMP, WORKOUT ID |
 | **Workouts** | exercise in a saved workout | ID, WORKOUT ID, WORKOUT, ORDER, EXERCISE, SETS, REPS, TIMED, SUPERSET WITH NEXT, UPDATED |
 | **Exercises** | exercise | EXERCISE, MUSCLE, NOTE, BEST WEIGHT, BEST EST 1RM, LONGEST HOLD (S), TARGET WEIGHT, UNIT, TARGET REASON, LAST DONE, SESSIONS, UPDATED |
 
@@ -40,6 +40,23 @@ Notes on the columns:
 - `VOLUME` is weight × reps for working sets.
 - `EST 1RM` = weight × (1 + reps ÷ 30).
 - Weights are in the `UNIT` of that row.
+
+## The sheet is the source of truth
+
+Each time the app opens, and when it comes back to the front after 5 minutes or more, it loads workouts, history, exercise notes and muscle groups from the sheet. A cleared or new phone gets everything back as soon as you sign in.
+
+You can edit the sheet by hand and the app will pick up the changes:
+
+| To change… | Edit |
+|---|---|
+| a logged set (weight, reps, difficulty) | its **SetLog** row |
+| a session note | **Sessions → NOTE** |
+| a saved workout (name, exercises, sets, reps, order, superset) | its **Workouts** rows |
+| an exercise's note or muscle group | **Exercises → NOTE / MUSCLE** |
+
+Calculated columns (EST 1RM, VOLUME, BEST…, TARGET…) are rewritten by the app, so editing them does nothing.
+
+**When the phone wins:** if it has changes the sheet hasn't received yet (logged offline, say), it sends those instead of loading, and that send overwrites the sheet. If the sheet comes back completely empty, the app refills it rather than wiping the phone.
 
 ## Offline
 

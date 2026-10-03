@@ -128,7 +128,7 @@ function emptyDb() {
     meta: {}, // per exercise (keyed by normalized name): { name, muscle, note, target, updatedAt }
     active: null, // the session currently being executed
     settings: { ...DEFAULT_SETTINGS },
-    sheets: { lastPush: 0, dirty: false, error: '' }, // device-only
+    sheets: { lastPush: 0, lastPull: 0, dirty: false, error: '' }, // device-only
     auth: { hash: '', at: 0 }, // device-only: SHA-256 of the password in Workouts!Z100
   };
 }
@@ -1524,7 +1524,7 @@ function sheetTabs() {
       work.length, Math.round(volume), s.unit, work.filter((x) => x.pr && x.pr.length).length,
       count('easy'), count('medium'), count('hard'),
       (s.progressions || []).map((u) => `${u.name} ${fmtNum(u.from)}→${fmtNum(u.to)}`).join('; '),
-      live ? 'In progress' : s.note || '', live ? Date.now() : s.updatedAt || s.finishedAt,
+      live ? 'In progress' : s.note || '', live ? Date.now() : s.updatedAt || s.finishedAt, s.workoutId || '',
     ]);
   };
   for (const s of db.history) sessionRows(s, false);
@@ -1641,7 +1641,6 @@ async function pushToSheet(quiet) {
 /* ---- Password lock (password lives in Workouts!Z100) ---- */
 
 let lockMessage = '';
-let lastVerify = 0;
 
 async function hashPassword(text) {
   const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
@@ -1677,10 +1676,9 @@ async function unlock() {
     if (!out.ok) throw new Error(out.error || 'Wrong password.');
     db.auth = { hash, at: Date.now() };
     lockMessage = '';
-    lastVerify = Date.now();
     save();
     route();
-    if (db.sheets.dirty || !db.sheets.lastPush) schedulePush(true);
+    syncWithSheet(true);
   } catch (err) {
     msg.textContent = sheetError(err);
     btn.disabled = false;
@@ -1696,25 +1694,155 @@ function signOut(message) {
   route();
 }
 
-// Re-check the password with the sheet now and then; offline, the app keeps working.
-async function verifySession() {
-  if (!db.auth.hash || !navigator.onLine || Date.now() - lastVerify < 5 * 60000) return;
-  lastVerify = Date.now();
+/* ---- Loading from the sheet (on open and when the app comes back to the front) ---- */
+
+// Unsent changes on the phone go up first; otherwise the sheet's copy comes down.
+// Also re-checks the password; offline, the app keeps working with what it has.
+let lastSync = 0;
+let pulling = false;
+
+async function syncWithSheet(force) {
+  if (!db.auth.hash || !navigator.onLine || pulling) return;
+  if (!force && Date.now() - lastSync < 5 * 60000) return;
+  lastSync = Date.now();
+  if (db.sheets.dirty) return pushToSheet(true);
+  pulling = true;
   try {
-    const out = await callSheet({ action: 'login', passwordHash: db.auth.hash });
-    if (!out.ok) handleAuthFailure(out);
-  } catch { /* unreachable: try again later */ }
+    const out = await callSheet({ action: 'pull', passwordHash: db.auth.hash });
+    if (!out.ok) return handleAuthFailure(out);
+    if (!out.tabs) return; // the sheet's script predates loading
+    if (db.sheets.dirty) return; // something was logged while loading: the phone's copy wins
+    const next = fromSheet(out.tabs);
+    if (!next.workouts.length && !next.history.length) {
+      if (db.workouts.length || db.history.length) schedulePush(true); // sheet was emptied: refill it
+      return;
+    }
+    db.workouts = next.workouts;
+    db.history = next.history;
+    db.meta = next.meta;
+    db.sheets.lastPull = Date.now();
+    save();
+    refreshView();
+  } catch { /* unreachable: try again later */ } finally {
+    pulling = false;
+  }
+}
+
+// Rebuild the app's data from sheet rows (objects keyed by header). Derived columns
+// (EST 1RM, VOLUME, BEST…) are ignored; they're recalculated from the sets.
+function fromSheet(tabs) {
+  const num = (v) => (v === '' || v == null || Number.isNaN(Number(v)) ? null : Number(v));
+  const str = (v) => (v == null ? '' : String(v).trim());
+  const yes = (v) => /^(y|yes|true|1)$/i.test(str(v));
+
+  const byWorkout = new Map();
+  for (const r of tabs.Workouts || []) {
+    if (!str(r.EXERCISE)) continue;
+    const id = str(r['WORKOUT ID']) || 'w-' + norm(r.WORKOUT);
+    if (!byWorkout.has(id)) byWorkout.set(id, { id, name: str(r.WORKOUT) || 'Workout', createdAt: 0, updatedAt: 0, exercises: [] });
+    const w = byWorkout.get(id);
+    w.updatedAt = Math.max(w.updatedAt, num(r.UPDATED) || 0);
+    w.createdAt = w.createdAt || w.updatedAt;
+    w.exercises.push({
+      id: str(r.ID) || uid(),
+      name: str(r.EXERCISE),
+      sets: Math.min(99, Math.max(1, parseInt(r.SETS, 10) || 1)),
+      reps: str(r.REPS) || '10',
+      link: yes(r['SUPERSET WITH NEXT']),
+      order: num(r.ORDER) ?? 0,
+    });
+  }
+  const workouts = [...byWorkout.values()].map((w) => {
+    w.exercises.sort((a, b) => a.order - b.order).forEach((e) => delete e.order);
+    w.exercises[w.exercises.length - 1].link = false;
+    return w;
+  });
+
+  // SetLog IDs are <session>-<exercise slot>-<set number>.
+  const bySession = new Map();
+  for (const r of tabs.SetLog || []) {
+    const parts = str(r.ID).split('-');
+    if (parts.length < 3 || !str(r.EXERCISE)) continue;
+    const sid = str(r['SESSION ID']) || parts.slice(0, -2).join('-');
+    const slot = Number(parts[parts.length - 2]) - 1;
+    const order = Number(parts[parts.length - 1]);
+    if (!bySession.has(sid)) bySession.set(sid, new Map());
+    const exercises = bySession.get(sid);
+    if (!exercises.has(slot)) exercises.set(slot, { name: str(r.EXERCISE), slot, superset: str(r.SUPERSET), sets: [] });
+    const d = str(r.DIFFICULTY).toLowerCase();
+    const set = { weight: num(r.WEIGHT) || 0, difficulty: ['easy', 'medium', 'hard'].includes(d) ? d : 'medium', at: num(r.TIMESTAMP) || 0, order };
+    const seconds = num(r.SECONDS);
+    if (seconds != null) set.seconds = seconds;
+    else set.reps = num(r.REPS) ?? str(r.REPS);
+    if (yes(r['WARM-UP'])) set.warmup = true;
+    const pr = str(r.PR).split(',').map((x) => x.trim()).filter(Boolean);
+    if (pr.length) set.pr = pr;
+    exercises.get(slot).sets.push(set);
+  }
+
+  const history = [];
+  for (const r of tabs.Sessions || []) {
+    const finishedAt = num(r.END);
+    const sets = bySession.get(str(r.ID));
+    if (!finishedAt || !sets) continue; // in progress (the phone has it) or no sets
+    const name = str(r.WORKOUT);
+    const byName = workouts.find((w) => norm(w.name) === norm(name));
+    history.push({
+      id: str(r.ID),
+      workoutId: str(r['WORKOUT ID']) || (byName ? byName.id : ''),
+      workoutName: name,
+      unit: str(r.UNIT) === 'kg' ? 'kg' : 'lb',
+      startedAt: num(r.START) || finishedAt,
+      finishedAt,
+      updatedAt: num(r.TIMESTAMP) || finishedAt,
+      note: str(r.NOTE),
+      progressions: str(r['NEXT TIME']).split(';').map((t) => t.trim().match(/^(.+) ([\d.,]+)→([\d.,]+)$/)).filter(Boolean)
+        .map((m) => ({ name: m[1], from: Number(m[2].replace(/,/g, '')), to: Number(m[3].replace(/,/g, '')) })),
+      exercises: [...sets.values()].sort((a, b) => a.slot - b.slot).map((e) => {
+        e.sets.sort((a, b) => a.order - b.order).forEach((x) => delete x.order);
+        e.timed = e.sets.some((x) => x.seconds != null);
+        return e;
+      }),
+    });
+  }
+  history.sort((a, b) => a.finishedAt - b.finishedAt);
+
+  const meta = {};
+  for (const r of tabs.Exercises || []) {
+    const name = str(r.EXERCISE);
+    if (!name) continue;
+    const m = { name, updatedAt: num(r.UPDATED) || 0 };
+    const muscle = str(r.MUSCLE);
+    if (MUSCLES.includes(muscle) && muscle !== guessMuscle(name)) m.muscle = muscle;
+    if (str(r.NOTE)) m.note = str(r.NOTE);
+    meta[norm(name)] = m; // next targets are recalculated from history
+  }
+  return { workouts, history, meta };
+}
+
+// Re-render after a background load, but never under the user's fingers.
+function refreshView() {
+  const focused = document.activeElement;
+  if (focused && app.contains(focused) && /^(INPUT|TEXTAREA|SELECT)$/.test(focused.tagName)) return;
+  if (['', 'history', 'progress', 'exercise', 'settings'].includes(currentView())) route(true);
 }
 
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') verifySession();
+  if (document.visibilityState === 'visible') syncWithSheet(false);
 });
+
+function sheetStatusText() {
+  const sh = db.sheets;
+  if (sh.error) return sh.error;
+  const last = Math.max(sh.lastPush || 0, sh.lastPull || 0);
+  return last ? 'In sync · ' + fmtAgo(last) : 'Not synced yet';
+}
 
 function setSheetStatus(text) {
   const el = document.getElementById('sheet-status');
   if (!el) return;
   const sh = db.sheets;
-  el.textContent = text || (sh.error ? sh.error : sh.lastPush ? 'Last sent ' + fmtAgo(sh.lastPush) : 'Not sent yet');
+  el.textContent = text || sheetStatusText();
   const tag = document.getElementById('sheet-tag');
   if (tag && !text) {
     tag.className = 'tag ' + (sh.error ? 'hard' : 'easy');
@@ -1731,7 +1859,7 @@ function renderSettings() {
   const sh = db.sheets;
   const sheetSection = `
     <p><span class="tag ${sh.error ? 'hard' : 'easy'}" id="sheet-tag">${sh.error ? 'Problem' : 'Live'}</span>
-      <span class="muted" id="sheet-status">${sh.error ? esc(sh.error) : sh.lastPush ? 'Last sent ' + fmtAgo(sh.lastPush) : 'Not sent yet'}</span></p>
+      <span class="muted" id="sheet-status">${esc(sheetStatusText())}</span></p>
     <div class="row gap"><button class="btn" data-action="sheet-send">⟳ Send now</button><button class="btn" data-action="lock-app">🔒 Lock app</button></div>
     <p class="muted small-note">The password is cell <b>Z100</b> in the sheet's Workouts tab. Change it there and every device has to enter the new one.</p>`;
 
@@ -1761,7 +1889,7 @@ function renderSettings() {
 
       <section class="card">
         <h2>Google Sheets</h2>
-        <p class="muted">Every set, session, workout and exercise goes to your Trackfit sheet seconds after you log it.</p>
+        <p class="muted">Every set goes to your Trackfit sheet seconds after you log it, and the app loads from the sheet each time you open it, so edits made in the sheet show up here.</p>
         <div class="stack">${sheetSection}</div>
       </section>
 
@@ -1993,10 +2121,7 @@ document.addEventListener('keydown', (e) => {
 window.addEventListener('hashchange', () => route());
 route();
 
-if (db.auth.hash) {
-  verifySession();
-  if (db.sheets.dirty) setTimeout(() => pushToSheet(true), 2500);
-}
+if (db.auth.hash) syncWithSheet(true);
 
 if ('serviceWorker' in navigator && location.protocol !== 'file:') {
   navigator.serviceWorker.register('sw.js').catch(() => {});
